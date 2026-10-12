@@ -132,7 +132,7 @@
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
                         <div>
                             <h3 class="text-lg font-bold text-slate-800 flex items-center"><i class="fa-solid fa-image text-indigo-600 mr-2"></i> Foto Jadwal Pelajaran</h3>
-                            <p class="text-xs text-slate-500 mt-1">Upload foto jadwal (misal dari sekolah), lalu ketuk untuk memperbesar & menggeser guna melihat jadwal hari yang diinginkan.</p>
+                            <p class="text-xs text-slate-500 mt-1">Upload foto jadwal sekali saja. Foto tersimpan di server (seperti foto siswa), jadi di HP/perangkat lain cukup tekan Sinkron dari Server. Ketuk foto untuk memperbesar & menggeser.</p>
                         </div>
                         <button onclick="pilihFileJadwalGambar()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl text-sm font-medium transition shadow-xs transform hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-2 self-start sm:self-auto">
                             <i class="fa-solid fa-upload"></i> Upload Gambar
@@ -1153,28 +1153,45 @@
             const file = e.target.files && e.target.files[0];
             if (!file) return;
             if (!file.type.startsWith('image/')) { showToast('File Tidak Valid', 'Silakan pilih file gambar.', false); return; }
-            const reader = new FileReader();
-            reader.onload = function(ev) {
-                const dataUrl = ev.target.result;
-                try {
-                    localStorage.setItem(JADWAL_GAMBAR_KEY, dataUrl);
-                    jadwalGambarData = dataUrl;
-                } catch (err) {
-                    showToast('Gagal Menyimpan', 'Ukuran gambar terlalu besar untuk disimpan di perangkat ini.', false);
-                    return;
-                }
+            // Dikompres (sisi terpanjang 1400px) agar teks jadwal tetap terbaca tapi ringan dikirim ke server
+            kompresGambar(file, function(dataUrl) {
+                jadwalGambarData = dataUrl;
                 renderJadwalGambarPreview();
-                showToast('Gambar Tersimpan', 'Foto jadwal berhasil diupload.');
-            };
-            reader.readAsDataURL(file);
+                try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (err) {} // kunci lama tidak dipakai lagi
+                saveLocalData(); // ikut state: tersimpan di perangkat & dikirim ke server
+                showToast('Gambar Tersimpan', SCRIPT_URL ? 'Foto jadwal tersimpan & dikirim ke server.' : 'Foto jadwal tersimpan di perangkat ini. Sambungkan Spreadsheet agar bisa dipanggil dari server.');
+            }, 1400, 0.7);
             e.target.value = '';
         }
 
         function hapusJadwalGambar() {
-            if (!confirm('Yakin ingin menghapus foto jadwal ini?')) return;
+            if (!confirm('Yakin ingin menghapus foto jadwal ini? Foto di server juga ikut terhapus.')) return;
             jadwalGambarData = null;
             try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (e) {}
             renderJadwalGambarPreview();
+            saveLocalData();
+        }
+
+        // Foto jadwal versi lama tersimpan di kunci localStorage terpisah & belum ke server.
+        // Dipindahkan sekali ke state (dikompres) supaya ikut tersinkron.
+        function migrasiJadwalGambarLama() {
+            let lama = null;
+            try { lama = localStorage.getItem(JADWAL_GAMBAR_KEY); } catch (e) {}
+            if (!lama) return;
+            const img = new Image();
+            img.onload = function() {
+                const maks = 1400;
+                let w = img.width, h = img.height;
+                if (w >= h && w > maks) { h = Math.round(h * maks / w); w = maks; }
+                else if (h > w && h > maks) { w = Math.round(w * maks / h); h = maks; }
+                const c = document.createElement('canvas'); c.width = w; c.height = h;
+                c.getContext('2d').drawImage(img, 0, 0, w, h);
+                jadwalGambarData = c.toDataURL('image/jpeg', 0.7);
+                try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (e) {}
+                renderJadwalGambarPreview();
+                saveLocalData();
+            };
+            img.src = lama;
         }
 
         // ---- Zoom & pan di dalam viewer ----
@@ -1390,7 +1407,7 @@
 
         function getFullState() {
             simpanBucketAktifKeMemory();
-            return { daftarKelas, kelasAktifId, semuaKelasData, jadwalMengajar, riwayatAgendaKegiatan, daftarJenisAktivitas };
+            return { daftarKelas, kelasAktifId, semuaKelasData, jadwalMengajar, riwayatAgendaKegiatan, daftarJenisAktivitas, jadwalGambar: jadwalGambarData };
         }
 
         function terapkanState(data) {
@@ -1402,6 +1419,8 @@
             if (data.daftarJenisAktivitas && data.daftarJenisAktivitas.length > 0) daftarJenisAktivitas = data.daftarJenisAktivitas;
             if (data.kelasAktifId && daftarKelas.some(k => k.id === data.kelasAktifId)) kelasAktifId = data.kelasAktifId;
             else kelasAktifId = daftarKelas[0].id;
+            // Foto jadwal ikut state/server. Jika data lama belum punya field ini, pertahankan yang ada di perangkat.
+            if (data.jadwalGambar !== undefined) { jadwalGambarData = data.jadwalGambar || null; renderJadwalGambarPreview(); }
 
             muatBucketDariMemory(kelasAktifId);
 
@@ -1675,7 +1694,7 @@
             if (e.key === 'Escape') closeLihatFotoAbsensi();
         });
 
-        function kompresGambar(file, callback, ukuranMaks = 640) {
+        function kompresGambar(file, callback, ukuranMaks = 640, kualitas = 0.72) {
             const reader = new FileReader();
             reader.onload = function(e) {
                 const img = new Image();
@@ -1686,7 +1705,7 @@
                     const canvas = document.createElement('canvas');
                     canvas.width = width; canvas.height = height;
                     canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-                    callback(canvas.toDataURL('image/jpeg', 0.72));
+                    callback(canvas.toDataURL('image/jpeg', kualitas));
                 };
                 img.src = e.target.result;
             };
@@ -2455,7 +2474,7 @@
             loadProfilGuru();
             loadJadwalGambar();
             const localData = loadLocalData();
-            if(localData) terapkanState(localData);
+            if(localData) { terapkanState(localData); migrasiJadwalGambarLama(); }
             else {
                 muatBucketDariMemory(kelasAktifId);
                 populateKelasSelector();
