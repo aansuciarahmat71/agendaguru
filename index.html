@@ -754,7 +754,7 @@
 
         function logoutGuru() {
             let pesan = 'Yakin ingin keluar? Profil & seluruh data di perangkat ini akan dihapus. Data yang sudah tersinkron ke Spreadsheet tetap aman di sana.';
-            if (typeof syncQueue !== 'undefined' && syncQueue.length > 0) {
+            if ((typeof syncQueue !== 'undefined' && syncQueue.length > 0) || (typeof jumlahFotoPending === 'function' && jumlahFotoPending() > 0)) {
                 pesan = 'Masih ada data yang BELUM tersinkron ke Spreadsheet! Kalau keluar sekarang, data itu bisa hilang dari perangkat ini. Yakin tetap ingin keluar?';
             }
             if (!confirm(pesan)) return;
@@ -763,7 +763,10 @@
                 localStorage.removeItem(PROFIL_KEY);
                 localStorage.removeItem(STORAGE_KEY);
                 localStorage.removeItem(QUEUE_KEY);
+                localStorage.removeItem(FOTO_PENDING_KEY);
+                localStorage.removeItem(JADWAL_GAMBAR_KEY);
             } catch (e) {}
+            try { indexedDB.deleteDatabase(FOTO_DB_NAMA); } catch (e) {}
 
             location.reload();
         }
@@ -1003,6 +1006,12 @@
             if (daftarKelas.length <= 1) { alert('Minimal harus ada 1 kelas.'); return; }
             if (!confirm(`Yakin ingin menghapus kelas ini beserta datanya?`)) return;
             daftarKelas = daftarKelas.filter(k => k.id !== id);
+            // Foto kelas yang dihapus ikut dibersihkan dari server
+            const bucketHapus = (id === kelasAktifId) ? { albumSiswaData } : semuaKelasData[id];
+            ((bucketHapus && bucketHapus.albumSiswaData) || []).forEach(it => {
+                if (it.fotoKey) { delete fotoMem[it.fotoKey]; idbHapusFoto(it.fotoKey); tambahFotoPending('hapus', it.fotoKey, false); }
+            });
+            prosesFotoPending();
             delete semuaKelasData[id];
             jadwalMengajar = jadwalMengajar.filter(j => j.kelasId !== id);
             riwayatAgendaKegiatan = riwayatAgendaKegiatan.filter(a => a.kelasId !== id);
@@ -1115,15 +1124,250 @@
             }
         }
 
-        // ==== UPLOAD & VIEWER FOTO JADWAL (ZOOM & GESER) ====
-        const JADWAL_GAMBAR_KEY = 'agendaGuru_jadwalGambar_v1';
-        let jadwalGambarData = null;
+        // ==== FOTO: CACHE DI PERANGKAT (IndexedDB) + SIMPAN/PANGGIL DARI SERVER ====
+        // Foto TIDAK lagi disimpan di state/localStorage. State hanya memuat "fotoKey".
+        // Gambarnya disimpan di IndexedDB perangkat (cache) dan di sheet tersembunyi "_Foto" di server.
+        // Foto dimuat per kelas hanya saat dibutuhkan, sehingga 12 kelas x 36 siswa tetap ringan.
+        const FOTO_DB_NAMA = 'agendaGuru_fotoDB_v1';
+        const FOTO_STORE = 'foto';
+        const FOTO_PENDING_KEY = 'agendaGuru_fotoPending_v1';
+        const FOTO_LOADING_SRC = 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 160"><rect width="120" height="160" fill="#eef2ff"/><circle cx="60" cy="62" r="20" fill="#c7d2fe"/><rect x="28" y="92" width="64" height="40" rx="20" fill="#c7d2fe"/></svg>');
+        let fotoMem = {};            // kunci -> dataURL (cache memori)
+        let fotoGagalSesi = {};      // kunci yang belum ditemukan di server pada sesi ini
+        let fotoSedangDimuat = {};
+        let fotoDbPromise = null;
+        let fotoPendingBerjalan = false;
+        let fotoServerLamaDiberitahu = false;
+        let migrasiFotoBerjalan = false;
 
-        function loadJadwalGambar() {
-            try { jadwalGambarData = localStorage.getItem(JADWAL_GAMBAR_KEY) || null; }
-            catch (e) { jadwalGambarData = null; }
-            renderJadwalGambarPreview();
+        function bukaFotoDB() {
+            if (!fotoDbPromise) {
+                fotoDbPromise = new Promise(resolve => {
+                    try {
+                        const rq = indexedDB.open(FOTO_DB_NAMA, 1);
+                        rq.onupgradeneeded = () => { rq.result.createObjectStore(FOTO_STORE); };
+                        rq.onsuccess = () => resolve(rq.result);
+                        rq.onerror = () => resolve(null);
+                    } catch (e) { resolve(null); }
+                });
+            }
+            return fotoDbPromise;
         }
+        function idbGetFoto(key) {
+            return bukaFotoDB().then(db => new Promise(resolve => {
+                if (!db) return resolve(null);
+                try {
+                    const rq = db.transaction(FOTO_STORE, 'readonly').objectStore(FOTO_STORE).get(key);
+                    rq.onsuccess = () => resolve(rq.result || null);
+                    rq.onerror = () => resolve(null);
+                } catch (e) { resolve(null); }
+            }));
+        }
+        function idbPutFoto(key, dataUrl) {
+            return bukaFotoDB().then(db => new Promise(resolve => {
+                if (!db) return resolve(false);
+                try {
+                    const tx = db.transaction(FOTO_STORE, 'readwrite');
+                    tx.objectStore(FOTO_STORE).put(dataUrl, key);
+                    tx.oncomplete = () => resolve(true);
+                    tx.onerror = () => resolve(false);
+                    tx.onabort = () => resolve(false);
+                } catch (e) { resolve(false); }
+            }));
+        }
+        function idbHapusFoto(key) {
+            return bukaFotoDB().then(db => new Promise(resolve => {
+                if (!db) return resolve(false);
+                try {
+                    const tx = db.transaction(FOTO_STORE, 'readwrite');
+                    tx.objectStore(FOTO_STORE).delete(key);
+                    tx.oncomplete = () => resolve(true);
+                    tx.onerror = () => resolve(false);
+                } catch (e) { resolve(false); }
+            }));
+        }
+
+        function buatKeyFoto(prefix = 'f') { return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+        function placeholderFoto(nama) { return 'https://placehold.co/400x400/eef2ff/4f46e5?text=' + encodeURIComponent(((nama || '?').trim().charAt(0) || '?')); }
+        function fotoSrc(item) { return item.fotoKey ? (fotoMem[item.fotoKey] || FOTO_LOADING_SRC) : item.foto; }
+
+        // ---- Antrian foto yang belum terkirim / belum terhapus di server (kecil, aman di localStorage) ----
+        function bacaFotoPending() {
+            try {
+                const p = JSON.parse(localStorage.getItem(FOTO_PENDING_KEY) || '{}');
+                return { upload: p.upload || [], hapus: p.hapus || [] };
+            } catch (e) { return { upload: [], hapus: [] }; }
+        }
+        function tulisFotoPending(p) {
+            try { localStorage.setItem(FOTO_PENDING_KEY, JSON.stringify(p)); } catch (e) {}
+            updateSyncBadge();
+        }
+        function jumlahFotoPending() { const p = bacaFotoPending(); return p.upload.length + p.hapus.length; }
+        function tambahFotoPending(jenis, key, langsungProses = true) {
+            const p = bacaFotoPending();
+            if (jenis === 'upload') { if (!p.upload.includes(key)) p.upload.push(key); }
+            else { p.upload = p.upload.filter(k => k !== key); if (!p.hapus.includes(key)) p.hapus.push(key); }
+            tulisFotoPending(p);
+            if (langsungProses) prosesFotoPending();
+        }
+        function selesaiPending(jenis, key) {
+            const p = bacaFotoPending();
+            p[jenis] = p[jenis].filter(k => k !== key);
+            tulisFotoPending(p);
+        }
+
+        function ambilFotoLokal(key) {
+            if (fotoMem[key]) return Promise.resolve(fotoMem[key]);
+            return idbGetFoto(key).then(v => { if (v) fotoMem[key] = v; return v; });
+        }
+        function urlServerFoto(params) { return `${SCRIPT_URL}?${params}&t=${Date.now()}`; }
+
+        function cekFotoDiServer(keys) {
+            return fetch(urlServerFoto('action=cekFoto&keys=' + encodeURIComponent(keys.join(',')))).then(r => r.json()).then(j => {
+                if (!j || j.ok === false) throw new Error((j && j.error) || 'Respon server tidak valid');
+                if (!Array.isArray(j.ada)) { // skrip server masih versi lama
+                    if (!fotoServerLamaDiberitahu) {
+                        fotoServerLamaDiberitahu = true;
+                        showToast('Skrip Server Belum Diperbarui', 'Tempel Code.gs terbaru di Apps Script lalu Deploy versi baru agar foto bisa tersimpan di server.', false);
+                    }
+                    return [];
+                }
+                return j.ada;
+            });
+        }
+
+        // Kirim foto yang belum ada di server (satu per satu, lalu diverifikasi), lalu hapus foto yang sudah tidak dipakai
+        function prosesFotoPending() {
+            if (!SCRIPT_URL || !navigator.onLine || fotoPendingBerjalan) return Promise.resolve();
+            if (jumlahFotoPending() === 0) return Promise.resolve();
+            fotoPendingBerjalan = true;
+            const awal = bacaFotoPending();
+            let rantai = Promise.resolve();
+            let berhasil = 0;
+
+            awal.upload.slice().forEach(key => {
+                rantai = rantai.then(() => ambilFotoLokal(key).then(dataUrl => {
+                    if (!dataUrl) { selesaiPending('upload', key); return; } // fotonya sudah tidak ada di perangkat ini
+                    return fetch(SCRIPT_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify({ type: 'foto', key, dataUrl }) })
+                        .then(() => cekFotoDiServer([key]))
+                        .then(ada => { if (ada.includes(key)) { selesaiPending('upload', key); berhasil++; } });
+                })).catch(() => {}); // satu foto gagal tidak menghentikan yang lain; dicoba lagi pada sinkron berikutnya
+            });
+
+            rantai = rantai.then(() => {
+                const hapus = bacaFotoPending().hapus.slice();
+                if (hapus.length === 0) return;
+                return fetch(SCRIPT_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify({ type: 'fotoHapus', keys: hapus }) })
+                    .then(() => hapus.forEach(k => selesaiPending('hapus', k)))
+                    .catch(() => {});
+            });
+
+            return rantai.then(() => {
+                fotoPendingBerjalan = false;
+                updateSyncBadge();
+                if (berhasil > 0) showToast('Foto Tersimpan di Server', `${berhasil} foto berhasil dikirim.`);
+                const p = bacaFotoPending();
+                if (p.upload.some(k => !awal.upload.includes(k)) || p.hapus.some(k => !awal.hapus.includes(k))) prosesFotoPending();
+            });
+        }
+
+        // ---- Memuat foto: cache perangkat dulu, sisanya dari server (per 8 foto) ----
+        function perbaruiGambarFoto(key) {
+            const src = fotoMem[key];
+            if (!src) return;
+            document.querySelectorAll('img[data-fotokey]').forEach(img => { if (img.dataset.fotokey === key) img.src = src; });
+        }
+        function muatFotoKelasAktif() {
+            return muatFotoByKeys(albumSiswaData.filter(a => a.fotoKey).map(a => a.fotoKey));
+        }
+        function muatFotoByKeys(keys) {
+            const perlu = keys.filter(k => !fotoMem[k] && !fotoSedangDimuat[k]);
+            if (perlu.length === 0) return Promise.resolve();
+            perlu.forEach(k => { fotoSedangDimuat[k] = true; });
+            return Promise.all(perlu.map(k => idbGetFoto(k).then(v => { if (v) { fotoMem[k] = v; perbaruiGambarFoto(k); } })))
+                .then(() => {
+                    const sisa = perlu.filter(k => !fotoMem[k] && !fotoGagalSesi[k]);
+                    if (sisa.length === 0 || !SCRIPT_URL || !navigator.onLine) return;
+                    let rantai = Promise.resolve();
+                    for (let i = 0; i < sisa.length; i += 8) {
+                        const kelompok = sisa.slice(i, i + 8);
+                        rantai = rantai.then(() => fetch(urlServerFoto('action=getFoto&keys=' + encodeURIComponent(kelompok.join(','))))
+                            .then(r => r.json())
+                            .then(j => {
+                                const fotos = (j && j.fotos) || {};
+                                kelompok.forEach(k => {
+                                    if (fotos[k]) { fotoMem[k] = fotos[k]; idbPutFoto(k, fotos[k]); perbaruiGambarFoto(k); }
+                                    else fotoGagalSesi[k] = true;
+                                });
+                            }).catch(() => {}));
+                    }
+                    return rantai;
+                })
+                .then(() => { perlu.forEach(k => { delete fotoSedangDimuat[k]; }); }, () => { perlu.forEach(k => { delete fotoSedangDimuat[k]; }); });
+        }
+
+        // ---- Terapkan foto baru ke satu siswa di album ----
+        function terapkanFotoKeItem(item, url) {
+            const keyLama = item.fotoKey || null;
+            if (url.startsWith('data:image/')) {
+                const key = buatKeyFoto();
+                fotoMem[key] = url;
+                idbPutFoto(key, url);
+                item.fotoKey = key;
+                item.foto = placeholderFoto(item.nama);
+                tambahFotoPending('upload', key);
+            } else { // tautan foto dari luar (URL biasa)
+                delete item.fotoKey;
+                item.foto = url;
+            }
+            if (keyLama) { delete fotoMem[keyLama]; idbHapusFoto(keyLama); tambahFotoPending('hapus', keyLama); }
+        }
+
+        // ---- Migrasi: foto lama yang tertanam langsung di data dipindah ke penyimpanan terpisah ----
+        function migrasiFotoLama() {
+            if (migrasiFotoBerjalan) return;
+            const kandidat = new Set();
+            const kumpul = arr => (arr || []).forEach(it => {
+                if (it && !it.fotoKey && typeof it.foto === 'string' && it.foto.startsWith('data:image/')) kandidat.add(it);
+            });
+            kumpul(albumSiswaData);
+            Object.keys(semuaKelasData).forEach(id => kumpul(semuaKelasData[id] && semuaKelasData[id].albumSiswaData));
+            if (kandidat.size === 0) return;
+            migrasiFotoBerjalan = true;
+            let rantai = Promise.resolve();
+            let jumlah = 0;
+            kandidat.forEach(item => {
+                rantai = rantai.then(() => {
+                    const key = buatKeyFoto();
+                    const dataUrl = item.foto;
+                    return idbPutFoto(key, dataUrl).then(ok => {
+                        if (!ok) return; // IndexedDB tidak tersedia: biarkan seperti semula
+                        fotoMem[key] = dataUrl;
+                        item.fotoKey = key;
+                        item.foto = placeholderFoto(item.nama);
+                        tambahFotoPending('upload', key, false);
+                        jumlah++;
+                    });
+                });
+            });
+            rantai.then(() => {
+                migrasiFotoBerjalan = false;
+                if (jumlah === 0) return;
+                saveLocalData();
+                renderAlbum();
+                if (typeof renderTabelAbsensi === 'function') renderTabelAbsensi();
+                showToast('Foto Dipindahkan', `${jumlah} foto dipindahkan ke penyimpanan terpisah & dikirim ke server.`);
+                prosesFotoPending();
+            });
+        }
+
+        // ==== UPLOAD & VIEWER FOTO JADWAL (ZOOM & GESER) ====
+        const JADWAL_GAMBAR_KEY = 'agendaGuru_jadwalGambar_v1'; // kunci lama (sebelum foto jadwal ikut server)
+        const JADWAL_MAKS_KARAKTER = 430000;                    // server menampung maks ±450.000 karakter per foto
+        let jadwalGambarData = null; // dataURL di memori (dari cache / server)
+        let jadwalGambarKey = null;  // kunci foto di server (ikut state)
+
+        function loadJadwalGambar() { renderJadwalGambarPreview(); }
 
         function renderJadwalGambarPreview() {
             const wrap = document.getElementById('jadwal-gambar-wrap');
@@ -1137,12 +1381,32 @@
                             <button onclick="hapusJadwalGambar()" title="Hapus Gambar" class="bg-rose-600/90 hover:bg-rose-600 text-white w-8 h-8 rounded-full flex items-center justify-center text-xs shadow"><i class="fa-solid fa-trash"></i></button>
                         </div>
                     </div>`;
+            } else if (jadwalGambarKey) {
+                wrap.innerHTML = `<div class="text-center py-6 text-slate-400 border-2 border-dashed border-slate-200 rounded-xl">
+                    <i class="fa-solid fa-cloud-arrow-down text-2xl mb-2"></i>
+                    <p class="text-xs italic">Foto jadwal tersimpan di server tetapi belum termuat di perangkat ini.</p>
+                    <button onclick="muatJadwalGambar(true)" class="mt-3 text-xs font-bold px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 transition"><i class="fa-solid fa-arrows-rotate mr-1"></i> Muat Foto Jadwal</button>
+                </div>`;
             } else {
                 wrap.innerHTML = `<div class="text-center py-6 text-slate-400 border-2 border-dashed border-slate-200 rounded-xl">
                     <i class="fa-solid fa-image text-2xl mb-2"></i>
                     <p class="text-xs italic">Belum ada foto jadwal. Upload foto jadwal pelajaran agar bisa dilihat kapan saja.</p>
                 </div>`;
             }
+        }
+
+        // Ambil foto jadwal dari cache perangkat, atau dari server bila belum ada
+        function muatJadwalGambar(paksa = false) {
+            const key = jadwalGambarKey;
+            if (!key) { jadwalGambarData = null; renderJadwalGambarPreview(); return Promise.resolve(); }
+            if (paksa) delete fotoGagalSesi[key];
+            if (paksa && !navigator.onLine) showToast('Tidak Ada Koneksi', 'Foto jadwal belum ada di perangkat ini. Coba lagi saat online.', false);
+            return muatFotoByKeys([key]).then(() => {
+                if (jadwalGambarKey !== key) return;
+                jadwalGambarData = fotoMem[key] || null;
+                renderJadwalGambarPreview();
+                if (paksa && !jadwalGambarData) showToast('Foto Belum Ditemukan', 'Foto jadwal belum ada di server. Buka perangkat yang mengunggahnya lalu tekan Sinkron.', false);
+            });
         }
 
         function pilihFileJadwalGambar() {
@@ -1153,45 +1417,73 @@
             const file = e.target.files && e.target.files[0];
             if (!file) return;
             if (!file.type.startsWith('image/')) { showToast('File Tidak Valid', 'Silakan pilih file gambar.', false); return; }
-            // Dikompres (sisi terpanjang 1400px) agar teks jadwal tetap terbaca tapi ringan dikirim ke server
-            kompresGambar(file, function(dataUrl) {
-                jadwalGambarData = dataUrl;
-                renderJadwalGambarPreview();
-                try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (err) {} // kunci lama tidak dipakai lagi
-                saveLocalData(); // ikut state: tersimpan di perangkat & dikirim ke server
-                showToast('Gambar Tersimpan', SCRIPT_URL ? 'Foto jadwal tersimpan & dikirim ke server.' : 'Foto jadwal tersimpan di perangkat ini. Sambungkan Spreadsheet agar bisa dipanggil dari server.');
-            }, 1400, 0.7);
+            const reader = new FileReader();
+            reader.onload = ev => adopsiJadwalDataUrl(ev.target.result, true);
+            reader.readAsDataURL(file);
             e.target.value = '';
+        }
+
+        // Kompres bertahap sampai cukup kecil untuk server, teks jadwal tetap terbaca
+        function kompresDataUrlJadwal(dataUrl, callback) {
+            const img = new Image();
+            img.onload = function() {
+                const preset = [[1400, 0.7], [1200, 0.62], [1000, 0.55], [800, 0.5]];
+                let hasil = null;
+                for (const [maks, q] of preset) {
+                    let w = img.width, h = img.height;
+                    if (w >= h && w > maks) { h = Math.round(h * maks / w); w = maks; }
+                    else if (h > w && h > maks) { w = Math.round(w * maks / h); h = maks; }
+                    const c = document.createElement('canvas'); c.width = w; c.height = h;
+                    c.getContext('2d').drawImage(img, 0, 0, w, h);
+                    hasil = c.toDataURL('image/jpeg', q);
+                    if (hasil.length <= JADWAL_MAKS_KARAKTER) break;
+                }
+                callback(hasil);
+            };
+            img.onerror = () => callback(null);
+            img.src = dataUrl;
+        }
+
+        function adopsiJadwalDataUrl(dataUrl, tampilToast) {
+            kompresDataUrlJadwal(dataUrl, function(hasil) {
+                if (!hasil || hasil.length > JADWAL_MAKS_KARAKTER + 10000) {
+                    showToast('Gambar Terlalu Besar', 'Foto jadwal tidak bisa dikecilkan cukup kecil. Coba foto yang lebih sederhana.', false);
+                    return;
+                }
+                const keyLama = jadwalGambarKey;
+                const key = buatKeyFoto('jadwal_');
+                fotoMem[key] = hasil;
+                idbPutFoto(key, hasil);
+                tambahFotoPending('upload', key);
+                if (keyLama) { delete fotoMem[keyLama]; idbHapusFoto(keyLama); tambahFotoPending('hapus', keyLama); }
+                jadwalGambarKey = key;
+                jadwalGambarData = hasil;
+                try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (err) {}
+                renderJadwalGambarPreview();
+                saveLocalData();
+                if (tampilToast) showToast('Gambar Tersimpan', SCRIPT_URL ? 'Foto jadwal tersimpan & sedang dikirim ke server.' : 'Foto jadwal tersimpan di perangkat ini. Sambungkan Spreadsheet agar bisa dipanggil dari server.');
+            });
         }
 
         function hapusJadwalGambar() {
             if (!confirm('Yakin ingin menghapus foto jadwal ini? Foto di server juga ikut terhapus.')) return;
+            if (jadwalGambarKey) {
+                const k = jadwalGambarKey;
+                delete fotoMem[k]; idbHapusFoto(k); tambahFotoPending('hapus', k);
+            }
+            jadwalGambarKey = null;
             jadwalGambarData = null;
             try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (e) {}
             renderJadwalGambarPreview();
             saveLocalData();
         }
 
-        // Foto jadwal versi lama tersimpan di kunci localStorage terpisah & belum ke server.
-        // Dipindahkan sekali ke state (dikompres) supaya ikut tersinkron.
+        // Foto jadwal versi lama (tersimpan di kunci localStorage terpisah) dipindahkan sekali ke sistem baru
         function migrasiJadwalGambarLama() {
+            if (jadwalGambarKey) return;
             let lama = null;
             try { lama = localStorage.getItem(JADWAL_GAMBAR_KEY); } catch (e) {}
-            if (!lama) return;
-            const img = new Image();
-            img.onload = function() {
-                const maks = 1400;
-                let w = img.width, h = img.height;
-                if (w >= h && w > maks) { h = Math.round(h * maks / w); w = maks; }
-                else if (h > w && h > maks) { w = Math.round(w * maks / h); h = maks; }
-                const c = document.createElement('canvas'); c.width = w; c.height = h;
-                c.getContext('2d').drawImage(img, 0, 0, w, h);
-                jadwalGambarData = c.toDataURL('image/jpeg', 0.7);
-                try { localStorage.removeItem(JADWAL_GAMBAR_KEY); } catch (e) {}
-                renderJadwalGambarPreview();
-                saveLocalData();
-            };
-            img.src = lama;
+            if (lama) adopsiJadwalDataUrl(lama, false);
         }
 
         // ---- Zoom & pan di dalam viewer ----
@@ -1407,7 +1699,7 @@
 
         function getFullState() {
             simpanBucketAktifKeMemory();
-            return { daftarKelas, kelasAktifId, semuaKelasData, jadwalMengajar, riwayatAgendaKegiatan, daftarJenisAktivitas, jadwalGambar: jadwalGambarData };
+            return { daftarKelas, kelasAktifId, semuaKelasData, jadwalMengajar, riwayatAgendaKegiatan, daftarJenisAktivitas, jadwalGambarKey };
         }
 
         function terapkanState(data) {
@@ -1419,8 +1711,15 @@
             if (data.daftarJenisAktivitas && data.daftarJenisAktivitas.length > 0) daftarJenisAktivitas = data.daftarJenisAktivitas;
             if (data.kelasAktifId && daftarKelas.some(k => k.id === data.kelasAktifId)) kelasAktifId = data.kelasAktifId;
             else kelasAktifId = daftarKelas[0].id;
-            // Foto jadwal ikut state/server. Jika data lama belum punya field ini, pertahankan yang ada di perangkat.
-            if (data.jadwalGambar !== undefined) { jadwalGambarData = data.jadwalGambar || null; renderJadwalGambarPreview(); }
+            fotoGagalSesi = {}; // beri kesempatan baru untuk foto yang sebelumnya belum ditemukan di server
+            // Foto jadwal: state hanya membawa kuncinya; gambarnya diambil dari cache perangkat / server.
+            if (data.jadwalGambar && typeof data.jadwalGambar === 'string' && data.jadwalGambar.startsWith('data:image/') && !data.jadwalGambarKey) {
+                adopsiJadwalDataUrl(data.jadwalGambar, false); // versi lama: gambar masih tertanam di state
+            } else if (data.jadwalGambarKey !== undefined) {
+                const keyBaru = data.jadwalGambarKey || null;
+                if (keyBaru !== jadwalGambarKey) { jadwalGambarKey = keyBaru; jadwalGambarData = null; }
+                muatJadwalGambar();
+            }
 
             muatBucketDariMemory(kelasAktifId);
 
@@ -1430,10 +1729,18 @@
             loadAbsensiTanggalSelected();
             loadAktivitasTanggalSelected();
             renderRekapAktivitasBulanan();
+            migrasiFotoLama(); // foto lama yang tertanam di data dipindah ke penyimpanan terpisah
         }
 
+        let penyimpananPenuhDiberitahu = false;
         function saveLocalData(tanpaKirimKeServer = false) {
-            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(getFullState())); } catch (e) {}
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(getFullState())); }
+            catch (e) {
+                if (!penyimpananPenuhDiberitahu) {
+                    penyimpananPenuhDiberitahu = true;
+                    showToast('Penyimpanan Perangkat Penuh', 'Data tidak bisa disimpan di perangkat ini. Pastikan tersambung ke Spreadsheet agar data aman di server.', false);
+                }
+            }
             if (!tanpaKirimKeServer && SCRIPT_URL) {
                 // Hanya simpan 1 snapshot 'state' terbaru di antrian (yang lama jadi usang & tidak perlu dikirim)
                 syncQueue = syncQueue.filter(q => q.payload.type !== 'state');
@@ -1459,6 +1766,7 @@
         }
 
         function processQueue(isManual = false) {
+            prosesFotoPending(); // kirim juga foto yang masih menunggu
             if (!SCRIPT_URL || syncQueue.length === 0 || !navigator.onLine) {
                 updateSyncBadge();
                 return;
@@ -1524,9 +1832,10 @@
         function updateSyncBadge() {
             const btn = document.getElementById('btn-sync-now');
             const countEl = document.getElementById('sync-pending-count');
-            if (syncQueue.length > 0) {
+            const totalMenunggu = syncQueue.length + jumlahFotoPending();
+            if (totalMenunggu > 0) {
                 btn.classList.remove('hidden'); btn.classList.add('flex');
-                countEl.innerText = `${syncQueue.length} data`;
+                countEl.innerText = `${totalMenunggu} data`;
             } else {
                 btn.classList.add('hidden'); btn.classList.remove('flex');
             }
@@ -1594,7 +1903,7 @@
                 card.className = "group bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs hover:shadow-md transition duration-300 relative flex flex-col";
                 card.innerHTML = `
                     <div class="relative w-full aspect-[3/4] overflow-hidden bg-slate-100">
-                        <img src="${item.foto}" alt="${item.nama}" class="absolute inset-0 w-full h-full object-cover object-top group-hover:scale-105 transition duration-300" onclick="lihatFotoAlbumFull('${item.foto.replace(/'/g, "\\'")}', '${item.nama.replace(/'/g, "\\'")}')">
+                        <img src="${fotoSrc(item)}" data-fotokey="${item.fotoKey || ''}" alt="${item.nama}" class="absolute inset-0 w-full h-full object-cover object-top group-hover:scale-105 transition duration-300" onclick="lihatFotoAlbumFull(this.src, '${item.nama.replace(/'/g, "\\'")}')">
                         <div class="absolute top-2 right-2 flex space-x-1.5">
                             <button onclick="openEditFotoModal(${item.id})" class="bg-indigo-600/80 hover:bg-indigo-600 text-white w-7 h-7 rounded-full flex items-center justify-center text-xs backdrop-blur-xs transition" title="Edit"><i class="fa-solid fa-pen"></i></button>
                             <button onclick="hapusFotoAlbum(${item.id})" class="bg-rose-600/80 hover:bg-rose-600 text-white w-7 h-7 rounded-full flex items-center justify-center text-xs backdrop-blur-xs transition" title="Hapus"><i class="fa-solid fa-trash"></i></button>
@@ -1613,6 +1922,7 @@
                 `;
                 container.appendChild(card);
             });
+            muatFotoKelasAktif(); // ambil foto kelas ini dari cache perangkat / server bila belum ada
         }
 
         function openAddFotoModal() {
@@ -1658,7 +1968,8 @@
             const inisial = siswa.nama.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
             const item = albumMatch || { nama: siswa.nama, alamat: '-', citacita: '-', foto: `https://placehold.co/400x400/eef2ff/4f46e5?text=${inisial}` };
 
-            document.getElementById('lihat-foto-absensi-img').src = item.foto;
+            document.getElementById('lihat-foto-absensi-img').src = fotoSrc(item);
+            document.getElementById('lihat-foto-absensi-img').dataset.fotokey = item.fotoKey || '';
             document.getElementById('lihat-foto-absensi-img').alt = item.nama;
             document.getElementById('lihat-foto-absensi-nama').innerText = item.nama;
             document.getElementById('lihat-foto-absensi-alamat').innerText = item.alamat && item.alamat !== '-' ? item.alamat : 'Alamat belum diisi';
@@ -1858,14 +2169,16 @@
             if (!nama) return;
 
             const selesai = (url) => {
+                let item;
                 if (editingFotoId !== null) {
-                    const item = albumSiswaData.find(s => s.id === editingFotoId);
+                    item = albumSiswaData.find(s => s.id === editingFotoId);
                     item.nama = nama; item.alamat = alamat; item.citacita = citacita;
-                    if(url) item.foto = url;
                 } else {
                     const newId = albumSiswaData.length > 0 ? Math.max(...albumSiswaData.map(a=>a.id)) + 1 : 1;
-                    albumSiswaData.push({ id: newId, nama, alamat, citacita, foto: url || 'https://placehold.co/400x400/eef2ff/4f46e5?text=' + nama.charAt(0) });
+                    item = { id: newId, nama, alamat, citacita, foto: placeholderFoto(nama) };
+                    albumSiswaData.push(item);
                 }
+                if (url) terapkanFotoKeItem(item, url); // foto baru disimpan terpisah (cache perangkat + server)
                 renderAlbum();
                 closeAddFotoModal();
                 saveLocalData();
@@ -1879,6 +2192,11 @@
 
         function hapusFotoAlbum(id) {
             if (confirm('Hapus foto ini?')) {
+                const yangDihapus = albumSiswaData.find(item => item.id === id);
+                if (yangDihapus && yangDihapus.fotoKey) {
+                    delete fotoMem[yangDihapus.fotoKey]; idbHapusFoto(yangDihapus.fotoKey);
+                    tambahFotoPending('hapus', yangDihapus.fotoKey);
+                }
                 albumSiswaData = albumSiswaData.filter(item => item.id !== id);
                 renderAlbum(); saveLocalData();
             }
@@ -2001,7 +2319,7 @@
                 `;
                 const albumMatch = albumSiswaData.find(a => a.nama.trim().toLowerCase() === siswa.nama.trim().toLowerCase());
                 const fotoThumb = albumMatch
-                    ? `<img src="${albumMatch.foto}" alt="${siswa.nama}" onclick="lihatFotoAbsensi(${index})" class="w-9 h-9 rounded-full object-cover cursor-pointer ring-2 ring-white shadow hover:ring-indigo-300 transition flex-shrink-0" title="Lihat foto ${siswa.nama}">`
+                    ? `<img src="${fotoSrc(albumMatch)}" data-fotokey="${albumMatch.fotoKey || ''}" alt="${siswa.nama}" onclick="lihatFotoAbsensi(${index})" class="w-9 h-9 rounded-full object-cover cursor-pointer ring-2 ring-white shadow hover:ring-indigo-300 transition flex-shrink-0" title="Lihat foto ${siswa.nama}">`
                     : `<div onclick="lihatFotoAbsensi(${index})" class="w-9 h-9 rounded-full bg-slate-200 text-slate-500 flex items-center justify-center text-xs font-bold flex-shrink-0 cursor-pointer hover:bg-slate-300 transition" title="Lihat foto ${siswa.nama}">${siswa.nama.charAt(0).toUpperCase()}</div>`;
                 tr.innerHTML = `
                     <td class="p-3 text-center text-slate-500">${index + 1}</td>
