@@ -25,6 +25,8 @@
     <script src='https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.8/index.global.min.js'></script>
     <script src='https://cdn.jsdelivr.net/npm/@fullcalendar/daygrid@6.1.8/index.global.min.js'></script>
     <script src='https://cdn.jsdelivr.net/npm/@fullcalendar/interaction@6.1.8/index.global.min.js'></script>
+    <!-- SheetJS untuk import Excel -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <!-- html2pdf untuk Export PDF -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 </head>
@@ -259,7 +261,7 @@
                             <div class="flex items-center justify-between mb-4">
                                 <h4 class="font-bold text-slate-800 text-sm flex items-center"><i class="fa-solid fa-chart-bar text-indigo-600 mr-2"></i> Rekapan Kehadiran Siswa <span class="ml-1 text-xs text-slate-500 font-normal">(Terhitung s/d Tanggal Dipilih)</span></h4>
                             </div>
-                            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
                                 <div class="bg-indigo-50 border border-indigo-100 p-4 rounded-xl">
                                     <span class="text-xs font-bold text-indigo-600 uppercase tracking-wide">1. Kehadiran Hari Itu</span>
                                     <div class="mt-2 text-xl font-bold text-indigo-900" id="stat-hadir-hari-ini">0 / 0 Siswa</div>
@@ -276,8 +278,14 @@
                                         <li class="text-slate-400 italic">Tidak ada</li>
                                     </ul>
                                 </div>
+                                <div class="bg-orange-50 border border-orange-100 p-4 rounded-xl">
+                                    <span class="text-xs font-bold text-orange-600 uppercase tracking-wide">4. Telat > 2 Kali</span>
+                                    <ul id="rekap-telat-list" class="mt-2 text-xs text-orange-900 space-y-1 list-disc list-inside">
+                                        <li class="text-slate-400 italic">Tidak ada</li>
+                                    </ul>
+                                </div>
                                 <div class="bg-blue-50 border border-blue-100 p-4 rounded-xl">
-                                    <span class="text-xs font-bold text-blue-600 uppercase tracking-wide">4. Siswa Dispensasi</span>
+                                    <span class="text-xs font-bold text-blue-600 uppercase tracking-wide">5. Siswa Dispensasi</span>
                                     <ul id="rekap-dispen-list" class="mt-2 text-xs text-blue-900 space-y-1 list-disc list-inside">
                                         <li class="text-slate-400 italic">Tidak ada</li>
                                     </ul>
@@ -459,15 +467,36 @@
     <div id="modal-import-siswa" class="fixed inset-0 bg-slate-900/50 backdrop-blur-xs hidden flex items-center justify-center z-50 p-4">
         <div class="bg-white p-6 rounded-2xl w-full max-w-lg shadow-xl border border-slate-100 max-h-[90vh] overflow-y-auto">
             <h3 class="text-lg font-bold text-slate-800 mb-2"><i class="fa-solid fa-file-import text-teal-600 mr-2"></i> Import Daftar Siswa</h3>
-            <p class="text-xs text-slate-500 mb-4">Tempel daftar nama siswa, satu nama per baris. Siswa baru akan otomatis masuk ke Absensi <span class="font-semibold">dan</span> Album Foto (dengan foto sementara berupa inisial nama).</p>
-            <div>
-                <label class="block text-sm font-medium text-slate-700 mb-1">Daftar Nama Siswa</label>
-                <textarea id="input-import-siswa" rows="10" class="w-full px-3 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-teal-500 focus:outline-none text-sm font-mono" placeholder="Ahmad Fauzi&#10;Dinda Kirana&#10;Farel Alamsyah"></textarea>
-                <p class="text-[11px] text-slate-400 mt-1">Nama yang sudah ada di daftar akan otomatis dilewati (tidak dobel).</p>
+            <p class="text-xs text-slate-500 mb-4">Siswa baru akan otomatis masuk ke Absensi <span class="font-semibold">dan</span> Album Foto (dengan foto sementara berupa inisial nama).</p>
+
+            <!-- Pilihan sumber import -->
+            <div class="flex gap-1 bg-slate-100 p-1 rounded-xl mb-4">
+                <button id="tab-import-excel" onclick="setImportMode('excel')" class="flex-1 text-sm font-semibold px-3 py-2 rounded-lg transition"><i class="fa-solid fa-file-excel mr-1.5"></i>Dari Excel</button>
+                <button id="tab-import-teks" onclick="setImportMode('teks')" class="flex-1 text-sm font-semibold px-3 py-2 rounded-lg transition"><i class="fa-solid fa-align-left mr-1.5"></i>Tempel Teks</button>
             </div>
+
+            <!-- Panel Excel -->
+            <div id="panel-import-excel">
+                <label for="input-import-excel" class="block border-2 border-dashed border-slate-300 hover:border-teal-500 hover:bg-teal-50/40 rounded-xl p-5 text-center cursor-pointer transition">
+                    <i class="fa-solid fa-cloud-arrow-up text-2xl text-teal-600"></i>
+                    <p id="import-excel-nama-file" class="text-sm font-semibold text-slate-700 mt-2">Pilih file Excel (.xlsx / .xls / .csv)</p>
+                    <p class="text-[11px] text-slate-400 mt-1">Format: kolom A = <b>Nama</b>, kolom B = <b>Kelas</b></p>
+                    <input id="input-import-excel" type="file" accept=".xlsx,.xls,.csv" class="hidden" onchange="pilihFileImportExcel(this)">
+                </label>
+                <button onclick="unduhTemplateImport()" class="mt-2 text-xs font-semibold text-teal-700 hover:text-teal-900"><i class="fa-solid fa-download mr-1"></i>Unduh template Excel</button>
+                <div id="import-excel-preview" class="mt-3 space-y-2"></div>
+            </div>
+
+            <!-- Panel Teks -->
+            <div id="panel-import-teks" class="hidden">
+                <label class="block text-sm font-medium text-slate-700 mb-1">Daftar Nama Siswa <span class="text-xs font-normal text-slate-400">(masuk ke kelas aktif: <span class="label-kelas-aktif font-semibold"></span>)</span></label>
+                <textarea id="input-import-siswa" rows="10" class="w-full px-3 py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-teal-500 focus:outline-none text-sm font-mono" placeholder="Ahmad Fauzi&#10;Dinda Kirana&#10;Farel Alamsyah"></textarea>
+            </div>
+            <p class="text-[11px] text-slate-400 mt-2">Nama yang sudah ada di kelas yang sama akan otomatis dilewati (tidak dobel).</p>
+
             <div class="flex justify-end space-x-2 pt-4">
                 <button onclick="closeImportSiswaModal()" class="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 text-sm font-medium hover:bg-slate-50">Batal</button>
-                <button onclick="prosesImportSiswa()" class="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-sm font-medium transition transform hover:-translate-y-0.5 active:translate-y-0"><i class="fa-solid fa-file-import mr-1.5"></i>Proses Import</button>
+                <button id="btn-proses-import" onclick="prosesImportSiswa()" class="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-sm font-medium transition transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-40 disabled:cursor-not-allowed disabled:transform-none"><i class="fa-solid fa-file-import mr-1.5"></i>Proses Import</button>
             </div>
         </div>
     </div>
@@ -2243,29 +2272,202 @@
             closeAddSiswaModal(); loadAbsensiTanggalSelected(); loadAktivitasTanggalSelected(); saveLocalData();
         }
 
+        // ============ IMPORT SISWA (EXCEL & TEKS) ============
+        let importMode = 'excel';
+        let importExcelRows = []; // [{ nama, kelas }]
+
+        function escHtmlImport(t) {
+            return String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+        function rapikanTeksImport(t) { return String(t == null ? '' : t).replace(/\s+/g, ' ').trim(); }
+        function buatInisialImport(nama) { return nama.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase(); }
+
         function openImportSiswaModal() {
-            if (!absensiKelasSudahDipilih) { showToast('Kelas Belum Dipilih', 'Pilih kelas terlebih dahulu.', false); return; }
             document.getElementById('input-import-siswa').value = '';
+            importExcelRows = [];
+            document.getElementById('input-import-excel').value = '';
+            document.getElementById('import-excel-nama-file').innerText = 'Pilih file Excel (.xlsx / .xls / .csv)';
+            document.getElementById('import-excel-preview').innerHTML = '';
+            document.querySelectorAll('.label-kelas-aktif').forEach(el => el.innerText = namaKelasAktif());
+            setImportMode('excel');
             document.getElementById('modal-import-siswa').classList.remove('hidden');
         }
         function closeImportSiswaModal() { document.getElementById('modal-import-siswa').classList.add('hidden'); }
-        
-        function prosesImportSiswa() {
-            const text = document.getElementById('input-import-siswa').value.trim();
-            if(!text) return;
-            const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-            let currentSiswaId = daftarSiswa.length > 0 ? Math.max(...daftarSiswa.map(s => s.id)) : 0;
-            let currentAlbumId = albumSiswaData.length > 0 ? Math.max(...albumSiswaData.map(a => a.id)) : 0;
 
-            lines.forEach(nama => {
-                if(!daftarSiswa.find(s => s.nama.toLowerCase() === nama.toLowerCase())) {
-                    currentSiswaId++; daftarSiswa.push({ id: currentSiswaId, nama });
-                    currentAlbumId++;
-                    const inisial = nama.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
-                    albumSiswaData.push({ id: currentAlbumId, nama: nama, alamat: '-', citacita: '-', foto: `https://placehold.co/400x400/eef2ff/4f46e5?text=${inisial}` });
+        function setImportMode(mode) {
+            importMode = mode;
+            const aktif = 'bg-white text-teal-700 shadow-sm';
+            const nonaktif = 'text-slate-500 hover:text-slate-700';
+            document.getElementById('tab-import-excel').className = 'flex-1 text-sm font-semibold px-3 py-2 rounded-lg transition ' + (mode === 'excel' ? aktif : nonaktif);
+            document.getElementById('tab-import-teks').className = 'flex-1 text-sm font-semibold px-3 py-2 rounded-lg transition ' + (mode === 'teks' ? aktif : nonaktif);
+            document.getElementById('panel-import-excel').classList.toggle('hidden', mode !== 'excel');
+            document.getElementById('panel-import-teks').classList.toggle('hidden', mode !== 'teks');
+            document.getElementById('btn-proses-import').disabled = (mode === 'excel' && importExcelRows.length === 0);
+        }
+
+        function unduhTemplateImport() {
+            if (typeof XLSX === 'undefined') { showToast('Pustaka Excel Belum Siap', 'Periksa koneksi internet lalu coba lagi.', false); return; }
+            const ws = XLSX.utils.aoa_to_sheet([
+                ['Nama', 'Kelas'],
+                ['Ahmad Fauzi', 'X-1'],
+                ['Dinda Kirana', 'X-1'],
+                ['Farel Alamsyah', 'X-2']
+            ]);
+            ws['!cols'] = [{ wch: 30 }, { wch: 12 }];
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Siswa');
+            XLSX.writeFile(wb, 'Template_Import_Siswa.xlsx');
+        }
+
+        function pilihFileImportExcel(input) {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            if (typeof XLSX === 'undefined') { showToast('Pustaka Excel Belum Siap', 'Periksa koneksi internet lalu coba lagi.', false); return; }
+            document.getElementById('import-excel-nama-file').innerText = file.name;
+            const reader = new FileReader();
+            reader.onload = e => {
+                try {
+                    const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+                    const ws = wb.Sheets[wb.SheetNames[0]];
+                    const baris = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+                    importExcelRows = parseBarisImport(baris);
+                } catch (err) {
+                    importExcelRows = [];
+                    showToast('File Tidak Terbaca', 'Pastikan file berformat .xlsx, .xls, atau .csv.', false);
                 }
+                renderPreviewImport();
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // Header "Nama"/"Kelas" dikenali otomatis; tanpa header: kolom 1 = nama, kolom 2 = kelas.
+        function parseBarisImport(baris) {
+            let idxNama = 0, idxKelas = 1, mulai = 0;
+            const cari = (row, kata) => row.findIndex(c => rapikanTeksImport(c).toLowerCase() === kata);
+            for (let i = 0; i < Math.min(baris.length, 5); i++) {
+                const n = cari(baris[i], 'nama'), k = cari(baris[i], 'kelas');
+                if (n !== -1) { idxNama = n; if (k !== -1) idxKelas = k; mulai = i + 1; break; }
+            }
+            const hasil = [];
+            for (let i = mulai; i < baris.length; i++) {
+                const nama = rapikanTeksImport(baris[i][idxNama]);
+                if (!nama) continue;
+                hasil.push({ nama, kelas: rapikanTeksImport(baris[i][idxKelas]) || namaKelasAktif() });
+            }
+            return hasil;
+        }
+
+        // Kelompokkan baris per kelas (tanpa membedakan huruf besar/kecil) dan tandai nama yang sudah ada / dobel.
+        function kelompokkanImport(rows) {
+            const peta = new Map();
+            rows.forEach(r => {
+                const key = r.kelas.toLowerCase();
+                if (!peta.has(key)) {
+                    const kelasAda = daftarKelas.find(k => rapikanTeksImport(k.nama).toLowerCase() === key);
+                    let siswaAda = [];
+                    if (kelasAda) {
+                        const bucket = kelasAda.id === kelasAktifId ? { daftarSiswa } : (semuaKelasData[kelasAda.id] || {});
+                        siswaAda = (bucket.daftarSiswa || []).map(s => s.nama.trim().toLowerCase());
+                    }
+                    peta.set(key, { nama: r.kelas, kelasAda, siswaAda: new Set(siswaAda), anggota: [], dilewati: [] });
+                }
+                const g = peta.get(key);
+                const nk = r.nama.toLowerCase();
+                if (g.siswaAda.has(nk)) g.dilewati.push(r.nama);
+                else { g.siswaAda.add(nk); g.anggota.push(r.nama); }
             });
+            return Array.from(peta.values());
+        }
+
+        function renderPreviewImport() {
+            const wrap = document.getElementById('import-excel-preview');
+            const btn = document.getElementById('btn-proses-import');
+            if (importExcelRows.length === 0) {
+                wrap.innerHTML = '<p class="text-xs text-rose-500 italic">Tidak ada data nama yang ditemukan di file ini.</p>';
+                btn.disabled = true;
+                return;
+            }
+            const grup = kelompokkanImport(importExcelRows);
+            const totalBaru = grup.reduce((t, g) => t + g.anggota.length, 0);
+            let html = `<p class="text-xs font-semibold text-slate-600">${importExcelRows.length} baris terbaca &rarr; ${grup.length} kelas, ${totalBaru} siswa baru</p>`;
+            grup.forEach((g, i) => {
+                const badge = g.kelasAda
+                    ? '<span class="text-[10px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full">Kelas sudah ada</span>'
+                    : '<span class="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">Kelas baru</span>';
+                const daftar = g.anggota.map((n, j) => `<li>${j + 1}. ${escHtmlImport(n)}</li>`).join('')
+                    + g.dilewati.map(n => `<li class="text-slate-400 line-through">${escHtmlImport(n)} <span class="no-underline text-[10px]">(sudah ada)</span></li>`).join('');
+                html += `
+                    <details ${i === 0 ? 'open' : ''} class="border border-slate-200 rounded-xl bg-slate-50/60">
+                        <summary class="cursor-pointer select-none px-3 py-2 flex items-center justify-between gap-2 text-sm font-bold text-slate-800">
+                            <span>Kelas ${escHtmlImport(g.nama)} <span class="text-xs font-semibold text-teal-700">(${g.anggota.length} siswa)</span></span>
+                            ${badge}
+                        </summary>
+                        <ul class="px-4 pb-3 pt-1 text-xs text-slate-700 space-y-0.5 max-h-40 overflow-y-auto">${daftar || '<li class="italic text-slate-400">Tidak ada siswa baru</li>'}</ul>
+                    </details>`;
+            });
+            wrap.innerHTML = html;
+            btn.disabled = totalBaru === 0;
+        }
+
+        function tambahSiswaKeBucket(bucket, namaList) {
+            bucket.daftarSiswa = bucket.daftarSiswa || [];
+            bucket.albumSiswaData = bucket.albumSiswaData || [];
+            let sid = bucket.daftarSiswa.length > 0 ? Math.max(...bucket.daftarSiswa.map(s => s.id)) : 0;
+            let aid = bucket.albumSiswaData.length > 0 ? Math.max(...bucket.albumSiswaData.map(a => a.id)) : 0;
+            namaList.forEach(nama => {
+                sid++; bucket.daftarSiswa.push({ id: sid, nama });
+                aid++; bucket.albumSiswaData.push({ id: aid, nama, alamat: '-', citacita: '-', foto: `https://placehold.co/400x400/eef2ff/4f46e5?text=${buatInisialImport(nama)}` });
+            });
+        }
+
+        function prosesImportSiswa() {
+            if (importMode === 'excel') { prosesImportExcel(); return; }
+            const text = document.getElementById('input-import-siswa').value.trim();
+            if (!text) return;
+            const lines = text.split('\n').map(l => rapikanTeksImport(l)).filter(l => l);
+            const sudah = new Set(daftarSiswa.map(s => s.nama.trim().toLowerCase()));
+            const baru = [];
+            lines.forEach(nama => { if (!sudah.has(nama.toLowerCase())) { sudah.add(nama.toLowerCase()); baru.push(nama); } });
+            const bucket = { daftarSiswa, albumSiswaData };
+            tambahSiswaKeBucket(bucket, baru);
+            daftarSiswa = bucket.daftarSiswa; albumSiswaData = bucket.albumSiswaData;
             closeImportSiswaModal(); loadAbsensiTanggalSelected(); loadAktivitasTanggalSelected(); renderAlbum(); saveLocalData();
+        }
+
+        function prosesImportExcel() {
+            const grup = kelompokkanImport(importExcelRows);
+            if (grup.every(g => g.anggota.length === 0)) return;
+            simpanBucketAktifKeMemory();
+            let kelasPertamaId = null, totalSiswa = 0, kelasBaru = 0;
+            grup.forEach((g, i) => {
+                let kelas = g.kelasAda;
+                if (!kelas) {
+                    kelas = { id: 'k' + Date.now() + '_' + i, nama: g.nama };
+                    daftarKelas.push(kelas);
+                    semuaKelasData[kelas.id] = bucketKelasKosong();
+                    kelasBaru++;
+                }
+                if (g.anggota.length === 0) return;
+                if (kelasPertamaId === null) kelasPertamaId = kelas.id;
+                if (kelas.id === kelasAktifId) {
+                    const b = { daftarSiswa, albumSiswaData };
+                    tambahSiswaKeBucket(b, g.anggota);
+                    daftarSiswa = b.daftarSiswa; albumSiswaData = b.albumSiswaData;
+                    simpanBucketAktifKeMemory();
+                } else {
+                    if (!semuaKelasData[kelas.id]) semuaKelasData[kelas.id] = bucketKelasKosong();
+                    tambahSiswaKeBucket(semuaKelasData[kelas.id], g.anggota);
+                }
+                totalSiswa += g.anggota.length;
+            });
+            populateKelasSelector();
+            closeImportSiswaModal();
+            // Tampilkan kelas pertama hasil import agar anggotanya langsung terlihat
+            if (kelasPertamaId && kelasPertamaId !== kelasAktifId) pilihKelasAbsensi(kelasPertamaId);
+            else { loadAbsensiTanggalSelected(); loadAktivitasTanggalSelected(); renderAlbum(); }
+            saveLocalData();
+            showToast('Import Berhasil', `${totalSiswa} siswa masuk ke ${grup.length} kelas${kelasBaru ? ` (${kelasBaru} kelas baru)` : ''}.`);
+            importExcelRows = [];
         }
 
         function hapusSiswa(id) {
@@ -2350,8 +2552,9 @@
         function updateRekapitulasiAkumulatif(tglTarget) {
             const alfaList = document.getElementById('rekap-alfa-list');
             const sakitList = document.getElementById('rekap-sakit-list');
+            const telatList = document.getElementById('rekap-telat-list');
             const dispenList = document.getElementById('rekap-dispen-list');
-            alfaList.innerHTML = ''; sakitList.innerHTML = ''; dispenList.innerHTML = '';
+            alfaList.innerHTML = ''; sakitList.innerHTML = ''; telatList.innerHTML = ''; dispenList.innerHTML = '';
 
             let rekap = {};
             daftarSiswa.forEach(s => { rekap[s.id] = { nama: s.nama, Hadir:0, Izin:0, Sakit:0, Alfa:0, Telat:0, Dispensasi:0 }; });
@@ -2366,15 +2569,17 @@
                 }
             });
 
-            let adaAlfa = false, adaSakit = false, adaDispen = false;
+            let adaAlfa = false, adaSakit = false, adaTelat = false, adaDispen = false;
             Object.values(rekap).forEach(r => {
                 if(r.Alfa > 2) { adaAlfa = true; alfaList.innerHTML += `<li>${r.nama} (${r.Alfa}x)</li>`; }
                 if(r.Sakit > 2) { adaSakit = true; sakitList.innerHTML += `<li>${r.nama} (${r.Sakit}x)</li>`; }
+                if(r.Telat > 2) { adaTelat = true; telatList.innerHTML += `<li>${r.nama} (${r.Telat}x)</li>`; }
                 if(r.Dispensasi > 0) { adaDispen = true; dispenList.innerHTML += `<li>${r.nama} (${r.Dispensasi}x)</li>`; }
             });
 
             if(!adaAlfa) alfaList.innerHTML = '<li class="text-slate-400 italic">Tidak ada (Aman)</li>';
             if(!adaSakit) sakitList.innerHTML = '<li class="text-slate-400 italic">Tidak ada</li>';
+            if(!adaTelat) telatList.innerHTML = '<li class="text-slate-400 italic">Tidak ada (Aman)</li>';
             if(!adaDispen) dispenList.innerHTML = '<li class="text-slate-400 italic">Tidak ada</li>';
         }
 
